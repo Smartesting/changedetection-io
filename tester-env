@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+RUN_ID="default"
+PORT="5029"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TESTER_ENV_PROJECT="${TESTER_ENV_PROJECT:-tester-env}"
+TESTER_ENV_APP="${TESTER_ENV_APP:-changedetection-io}"
+TESTER_ENV_SCENARIO="${TESTER_ENV_SCENARIO:-manual}"
+
+refresh_names() {
+    local suffix=""
+    if [[ "${RUN_ID}" != "default" ]]; then
+        suffix="-${RUN_ID}"
+    fi
+
+    IMAGE_NAME="${IMAGE_TAG:-tester-env-changedetection-io:dev}"
+    CONTAINER_NAME="tester-env-changedetection-io${suffix}"
+    DATA_VOLUME="changedetection-io-data${suffix}"
+}
+
+wait_for_http() {
+    local url="http://127.0.0.1:${PORT}/"
+    for _ in $(seq 1 60); do
+        if python3 - "${url}" <<'PY' >/dev/null 2>&1
+import sys, urllib.request
+urllib.request.urlopen(sys.argv[1], timeout=2).read()
+PY
+        then
+            return 0
+        fi
+        sleep 1
+    done
+    echo "App did not become ready at ${url}" >&2
+    return 1
+}
+
+cmd_deploy() {
+    local ref="${1:-}"
+
+    if [[ -n "${ref}" ]]; then
+        echo "==> Checking out ref: ${ref}"
+        git -C "${SCRIPT_DIR}" checkout "${ref}"
+    fi
+
+    echo "==> Building Docker image ${IMAGE_NAME}"
+    docker build \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        -t "${IMAGE_NAME}" \
+        "${SCRIPT_DIR}"
+
+    echo "==> Starting ${CONTAINER_NAME} on port ${PORT}"
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker volume create \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+        "${DATA_VOLUME}" >/dev/null
+    docker run -d --name "${CONTAINER_NAME}" \
+        --label "tester-env.project=${TESTER_ENV_PROJECT}" \
+        --label "tester-env.app=${TESTER_ENV_APP}" \
+        --label "tester-env.scenario=${TESTER_ENV_SCENARIO}" \
+        --label "tester-env.run_id=${TESTER_ENV_RUN_ID:-${RUN_ID}}" \
+        -p "${PORT}:5000" \
+        -v "${DATA_VOLUME}:/datastore" \
+        -e DISABLE_VERSION_CHECK=true \
+        -e LOGGER_LEVEL=WARNING \
+        "${IMAGE_NAME}"
+    wait_for_http
+    echo "==> Deployment complete: http://localhost:${PORT}"
+}
+
+cmd_seed() {
+    echo "==> Seeding deterministic watches"
+    local api_key
+    api_key="$(docker exec "${CONTAINER_NAME}" python3 -c 'import json; print(json.load(open("/datastore/changedetection.json"))["settings"]["application"]["api_access_token"])')"
+    TESTER_ENV_URL="http://127.0.0.1:${PORT}" TESTER_ENV_API_KEY="${api_key}" python3 "${SCRIPT_DIR}/tester-env-seed.py"
+    echo "==> Seed complete"
+}
+
+cmd_verify() {
+    echo "==> Verifying deterministic seed"
+    local api_key
+    api_key="$(docker exec "${CONTAINER_NAME}" python3 -c 'import json; print(json.load(open("/datastore/changedetection.json"))["settings"]["application"]["api_access_token"])')"
+    TESTER_ENV_URL="http://127.0.0.1:${PORT}" TESTER_ENV_API_KEY="${api_key}" python3 "${SCRIPT_DIR}/tester-env-verify.py"
+    echo "==> Verify complete"
+}
+
+cmd_reset() {
+    echo "==> Resetting ${CONTAINER_NAME} and ${DATA_VOLUME}"
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker rm "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+    docker volume rm "${DATA_VOLUME}" >/dev/null 2>&1 || true
+    echo "==> Reset complete"
+}
+
+cmd_stop() {
+    docker stop "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+}
+
+cmd_logs() {
+    docker logs -f "${CONTAINER_NAME}"
+}
+
+cmd_status() {
+    if docker ps --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' | python3 -c "import sys; raise SystemExit(0 if sys.stdin.read().strip() else 1)"; then
+        echo "Status: RUNNING"
+        echo "URL: http://localhost:${PORT}"
+        echo "Container: ${CONTAINER_NAME}"
+        echo "Volume: ${DATA_VOLUME}"
+    else
+        echo "Status: NOT RUNNING"
+    fi
+}
+
+cmd_help() {
+    cat <<EOF
+changedetection.io tester-env CLI
+
+Usage: ./tester-env <command> [--ref <git-ref>] [--run-id <id>] [--port <port>]
+
+Commands: deploy, seed, verify, reset, stop, logs, status, help
+
+Typical workflow:
+  ./tester-env reset --port 5029
+  ./tester-env deploy --port 5029
+  ./tester-env seed --port 5029
+  ./tester-env verify --port 5029
+
+Credentials: none by default.
+EOF
+}
+
+main() {
+    local cmd="${1:-help}"
+    local ref=""
+
+    for ((i=2; i<=$#; i++)); do
+        local arg="${!i}"
+        case "${arg}" in
+            --ref) local next=$((i+1)); ref="${!next}"; ((i++)) ;;
+            --run-id) local next=$((i+1)); RUN_ID="${!next}"; ((i++)) ;;
+            --port) local next=$((i+1)); PORT="${!next}"; ((i++)) ;;
+            --help|-h) cmd_help; exit 0 ;;
+            *) echo "Unknown option: ${arg}" >&2; cmd_help; exit 1 ;;
+        esac
+    done
+
+    refresh_names
+    case "${cmd}" in
+        deploy) cmd_deploy "${ref}" ;;
+        seed) cmd_seed ;;
+        verify) cmd_verify ;;
+        reset) cmd_reset ;;
+        stop) cmd_stop ;;
+        logs) cmd_logs ;;
+        status) cmd_status ;;
+        help|--help|-h) cmd_help ;;
+        *) echo "Unknown command: ${cmd}" >&2; cmd_help; exit 1 ;;
+    esac
+}
+
+main "$@"
